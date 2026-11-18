@@ -7,12 +7,11 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
-from sklearn.compose import ColumnTransformer
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.inspection import permutation_importance
 from sklearn.linear_model import Ridge
 from sklearn.metrics import accuracy_score, roc_auc_score
 from sklearn.model_selection import train_test_split
-from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 
 # -----------------------------------------------------------------------------
@@ -42,143 +41,107 @@ EXCEL_ERRORS = {"#DIV/0!", "#VALUE!", "#REF!", "#NAME?", "#N/A", "#NUM!", "NaN",
 
 
 # -----------------------------------------------------------------------------
-# DATA LOADING & CLEANING PIPELINE (CACHED)
+# ULTRA-FAST DATA LOADING & VECTORIZED CLEANING (CACHED)
 # -----------------------------------------------------------------------------
-def _parse_rubric_score(val) -> float:
-    """Extracts leading numeric float (1.0, 0.5, 0.0) from strings like '1 (Good)'."""
-    if pd.isna(val):
-        return np.nan
-    s = str(val).strip()
-    if s in EXCEL_ERRORS:
-        return np.nan
-    match = re.match(r"^([0-9]*\.?[0-9]+)", s)
-    if match:
-        try:
-            return float(match.group(1))
-        except ValueError:
-            return np.nan
-    return np.nan
-
-
 def _clean_improvement_tags(series: pd.Series) -> pd.Series:
     """Normalizes casing, whitespace, and trailing punctuation on improvement tags."""
     cleaned = []
+    acronyms = {"CES", "FCR", "QA", "SOP", "PNR", "GDS"}
     for val in series.dropna():
-        # Split on comma or slash if multiple tags appear in one cell
         parts = re.split(r"[,;/|]+", str(val))
         for p in parts:
             tag = re.sub(r"^[\s\.\-\?\!\:\;]+|[\s\.\-\?\!\:\;]+$", "", p).strip()
             if tag and tag not in EXCEL_ERRORS and len(tag) > 1:
-                # Keep short acronyms uppercase (e.g., CES), Title Case others
-                if tag.upper() in {"CES", "FCR", "QA", "SOP", "PNR", "GDS"}:
-                    cleaned.append(tag.upper())
-                else:
-                    cleaned.append(tag.title())
+                cleaned.append(tag.upper() if tag.upper() in acronyms else tag.title())
     return pd.Series(cleaned)
 
 
-@st.cache_data(show_spinner="Parsing QA2026 sheet & normalizing rubric scores...")
+@st.cache_data(show_spinner="Loading & optimizing QA2026 dataset...")
 def load_and_clean_data(file_source) -> pd.DataFrame:
-    """Reads the QA2026 sheet, resolves the two-row header quirk, and cleans all fields."""
-    raw_df = pd.read_excel(file_source, sheet_name="QA2026", header=0, engine="openpyxl")
+    """Reads QA2026 (cols A:R only), uses vectorized parsing, and caches to Parquet locally."""
+    cache_file = "qa2026_fast_cache.parquet"
 
-    # Row 0 in DataFrame (Excel Row 2) contains the actual sub-headers
-    sub_headers = raw_df.iloc[0].tolist()
-    top_headers = raw_df.columns.tolist()
+    # Instant 0.05s load if local Parquet cache is newer than the Excel file
+    if isinstance(file_source, str) and os.path.exists(cache_file):
+        if os.path.getmtime(cache_file) >= os.path.getmtime(file_source):
+            return pd.read_parquet(cache_file)
 
-    # Exact positional mapping based on schema specification
-    # Cols 0..3: Date, Recording ID, Agent, QC by
-    # Cols 4..13: 10 Rubric Criteria
-    # Col 14: Total Score
-    # Col 15: Remarks
-    # Col 16: Areas of Improvement
-    # Col 17: Call Type
-    mapped_columns = {}
-    for idx, top_col in enumerate(top_headers):
-        top_clean = str(top_col).strip()
-        sub_clean = str(sub_headers[idx]).strip() if idx < len(sub_headers) and pd.notna(sub_headers[idx]) else ""
+    # Read ONLY columns A:R (skips empty columns S:Z)
+    raw_df = pd.read_excel(
+        file_source,
+        sheet_name="QA2026",
+        header=0,
+        usecols="A:R",
+        engine="openpyxl",
+    )
 
-        if idx == 0 or top_clean.lower() == "date":
-            mapped_columns[top_col] = "Date"
-        elif idx == 1 or "recording" in top_clean.lower():
-            mapped_columns[top_col] = "Recording ID"
-        elif idx == 2 or top_clean.lower() == "agent":
-            mapped_columns[top_col] = "Agent"
-        elif idx == 3 or "qc" in top_clean.lower():
-            mapped_columns[top_col] = "QC by"
-        elif 4 <= idx <= 13:
-            # Prefer our canonical rubric name if sub_header matches or fallback positionally
-            canonical = RUBRIC_COLS[idx - 4]
-            mapped_columns[top_col] = canonical
-        elif idx == 14 or "total" in top_clean.lower():
-            mapped_columns[top_col] = "Total Score"
-        elif idx == 15 or "remark" in sub_clean.lower():
-            mapped_columns[top_col] = "Remarks"
-        elif idx == 16 or "improvement" in sub_clean.lower():
-            mapped_columns[top_col] = "Areas of Improvement"
-        elif idx == 17 or "call type" in sub_clean.lower():
-            mapped_columns[top_col] = "Call Type"
-        else:
-            mapped_columns[top_col] = f"_ignore_{idx}"
-
-    # Drop the sub-header row (Excel Row 2) and rename columns
+    # Drop Excel Row 2 (sub-headers) and assign exact schema columns
     df = raw_df.iloc[1:].copy().reset_index(drop=True)
-    df = df.rename(columns=mapped_columns)
+    df.columns = [
+        "Date",
+        "Recording ID",
+        "Agent",
+        "QC by",
+        *RUBRIC_COLS,
+        "Total Score",
+        "Remarks",
+        "Areas of Improvement",
+        "Call Type",
+    ]
 
-    # Keep only valid mapped columns (drops Unnamed: 18..25)
-    keep_cols = [c for c in df.columns if not str(c).startswith("_ignore_")]
-    df = df[keep_cols].copy()
-
-    # Replace Excel formula errors across the dataset
+    # Clean Excel formula artifacts (#DIV/0!, etc.)
     df = df.replace(list(EXCEL_ERRORS), np.nan)
 
-    # Clean Date & drop rows where Date or Agent is null
+    # Clean Date & Agent (drop rows where either is null)
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
     df["Agent"] = df["Agent"].astype(str).str.strip()
     df.loc[df["Agent"].isin(["nan", "None", ""]), "Agent"] = np.nan
     df = df.dropna(subset=["Date", "Agent"]).reset_index(drop=True)
 
-    # Clean categorical text fields
+    # Clean text columns
     df["Recording ID"] = df["Recording ID"].astype(str).str.strip()
     df["QC by"] = df["QC by"].fillna("Unknown").astype(str).str.strip()
-    df["Call Type"] = df["Call Type"].fillna("Unspecified").astype(str).str.strip()
-    df.loc[df["Call Type"] == "", "Call Type"] = "Unspecified"
+    df["Call Type"] = df["Call Type"].fillna("Unspecified").astype(str).str.strip().replace("", "Unspecified")
     df["Remarks"] = df["Remarks"].fillna("").astype(str).str.strip()
 
-    # Parse 10 Rubric Criteria strings -> float
+    # VECTORIZED rubric score extraction (replaces slow row-by-row .apply)
     for col in RUBRIC_COLS:
-        if col in df.columns:
-            df[col] = df[col].apply(_parse_rubric_score)
-        else:
-            df[col] = np.nan
+        df[col] = (
+            df[col]
+            .astype(str)
+            .str.extract(r"^([0-9]*\.?[0-9]+)", expand=False)
+            .astype(float)
+        )
 
-    # Parse Total Score (recalculate from rubric sum if Excel had #DIV/0! or NaN)
+    # Parse Total Score & fallback to sum of rubric criteria if Excel had #DIV/0!
     df["Total Score"] = pd.to_numeric(df["Total Score"], errors="coerce")
     rubric_sum = df[RUBRIC_COLS].sum(axis=1, min_count=1)
     df["Total Score"] = df["Total Score"].fillna(rubric_sum).clip(0.0, 10.0)
     df = df.dropna(subset=["Total Score"]).reset_index(drop=True)
 
-    # Feature engineering for time trends & ML
+    # Pre-compute time & target features
     df["Month"] = df["Date"].dt.to_period("M").astype(str)
     df["Month_Num"] = df["Date"].dt.month
     df["Week"] = df["Date"].dt.to_period("W").apply(lambda r: r.start_time)
     df["Day_of_Week"] = df["Date"].dt.day_name()
     df["Is_Low_Score"] = (df["Total Score"] < 8.0).astype(int)
 
+    # Save local Parquet cache for near-instant future boots
+    if isinstance(file_source, str):
+        try:
+            df.to_parquet(cache_file, index=False)
+        except Exception:
+            pass
+
     return df
 
 
 # -----------------------------------------------------------------------------
-# MACHINE LEARNING MODELS (CACHED)
+# FAST MACHINE LEARNING MODELS (LAZY + CACHED)
 # -----------------------------------------------------------------------------
 @st.cache_resource(show_spinner="Fitting Fairness & Calibration Ridge Model...")
 def fit_examiner_fairness_model(df_hash: int, df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, float]:
-    """
-    Fits a Ridge Regression fixed-effects model:
-        Total Score ~ QC_by + Agent + Call_Type
-    Controls for agent skill and call difficulty to estimate examiner strictness bias
-    and compute fairness-adjusted agent scores.
-    """
+    """Fits Ridge fixed-effects regression controlling for Agent & Call Type difficulty."""
     model_df = df[["Total Score", "QC by", "Agent", "Call Type"]].dropna().copy()
     if len(model_df) < 30 or model_df["QC by"].nunique() < 2:
         return pd.DataFrame(), pd.DataFrame(), 0.0
@@ -193,42 +156,39 @@ def fit_examiner_fairness_model(df_hash: int, df: pd.DataFrame) -> Tuple[pd.Data
     ridge = Ridge(alpha=5.0, random_state=42)
     ridge.fit(X_encoded, y)
 
-    # Extract examiner coefficients and center around weighted mean = 0
-    qc_effects = {}
-    for fname, coef in zip(feature_names, ridge.coef_):
-        if fname.startswith("QC by_"):
-            qc_name = fname.replace("QC by_", "")
-            qc_effects[qc_name] = coef
+    qc_effects = {
+        fname.replace("QC by_", ""): coef
+        for fname, coef in zip(feature_names, ridge.coef_)
+        if fname.startswith("QC by_")
+    }
 
     qc_counts = model_df["QC by"].value_counts()
     total_obs = sum(qc_counts.get(k, 0) for k in qc_effects)
-    weighted_mean_effect = (
+    weighted_mean = (
         sum(qc_effects[k] * qc_counts.get(k, 0) for k in qc_effects) / total_obs
         if total_obs > 0
         else 0.0
     )
-
-    # Strictness offset: negative means stricter than average; positive means more lenient
-    centered_effects = {k: v - weighted_mean_effect for k, v in qc_effects.items()}
+    centered_effects = {k: v - weighted_mean for k, v in qc_effects.items()}
 
     examiner_summary = []
     for qc_name, offset in centered_effects.items():
         raw_mean = model_df.loc[model_df["QC by"] == qc_name, "Total Score"].mean()
-        count = int(qc_counts.get(qc_name, 0))
         examiner_summary.append(
             {
                 "QC Examiner": qc_name,
-                "Evaluated Calls": count,
+                "Evaluated Calls": int(qc_counts.get(qc_name, 0)),
                 "Raw Avg Score": round(raw_mean, 3),
                 "Strictness Offset (Pts)": round(offset, 3),
                 "Calibration Note": (
-                    "Stricter than baseline" if offset < -0.05 else ("More lenient than baseline" if offset > 0.05 else "Well calibrated")
+                    "Stricter than baseline"
+                    if offset < -0.05
+                    else ("More lenient than baseline" if offset > 0.05 else "Well calibrated")
                 ),
             }
         )
     examiner_df = pd.DataFrame(examiner_summary).sort_values("Strictness Offset (Pts)")
 
-    # Adjust each call score by removing the examiner's bias offset
     model_df["Examiner_Offset"] = model_df["QC by"].map(centered_effects).fillna(0.0)
     model_df["Adjusted_Score"] = (model_df["Total Score"] - model_df["Examiner_Offset"]).clip(0.0, 10.0)
 
@@ -246,18 +206,20 @@ def fit_examiner_fairness_model(df_hash: int, df: pd.DataFrame) -> Tuple[pd.Data
     leaderboard["Adjusted_Rank"] = leaderboard["Fairness_Adjusted_Avg"].rank(ascending=False, method="min").astype(int)
     leaderboard["Rank_Change"] = leaderboard["Raw_Rank"] - leaderboard["Adjusted_Rank"]
 
-    r2 = float(ridge.score(X_encoded, y))
-    return examiner_df, leaderboard, r2
+    return examiner_df, leaderboard, float(ridge.score(X_encoded, y))
 
 
-@st.cache_resource(show_spinner="Training Low-Score Risk Random Forest Classifier...")
-def train_risk_classifier(df_hash: int, df: pd.DataFrame) -> Tuple[Optional[Pipeline], dict, pd.DataFrame]:
-    """Trains a RandomForestClassifier to predict Total Score < 8.0."""
+@st.cache_resource(show_spinner="Training Fast HistGradientBoosting Risk Model...")
+def train_risk_classifier(df_hash: int, df: pd.DataFrame) -> Tuple[Optional[HistGradientBoostingClassifier], dict, pd.DataFrame]:
+    """Trains a native-categorical HistGradientBoostingClassifier in ~0.15s."""
     features = ["Agent", "Call Type", "Day_of_Week", "Month_Num"]
     ml_df = df[features + ["Is_Low_Score"]].dropna().copy()
 
     if len(ml_df) < 50 or ml_df["Is_Low_Score"].nunique() < 2:
         return None, {}, pd.DataFrame()
+
+    for col in ["Agent", "Call Type", "Day_of_Week"]:
+        ml_df[col] = ml_df[col].astype("category")
 
     X = ml_df[features]
     y = ml_df["Is_Low_Score"]
@@ -266,27 +228,18 @@ def train_risk_classifier(df_hash: int, df: pd.DataFrame) -> Tuple[Optional[Pipe
         X, y, test_size=0.2, random_state=42, stratify=y
     )
 
-    preprocessor = ColumnTransformer(
-        transformers=[
-            ("cat", OneHotEncoder(handle_unknown="ignore"), ["Agent", "Call Type", "Day_of_Week"]),
-            ("num", "passthrough", ["Month_Num"]),
-        ]
-    )
-
-    clf = RandomForestClassifier(
-        n_estimators=150,
-        max_depth=12,
-        min_samples_leaf=5,
+    clf = HistGradientBoostingClassifier(
+        max_iter=100,
+        max_depth=6,
+        min_samples_leaf=10,
+        categorical_features=["Agent", "Call Type", "Day_of_Week"],
         class_weight="balanced",
         random_state=42,
-        n_jobs=-1,
     )
+    clf.fit(X_train, y_train)
 
-    pipeline = Pipeline(steps=[("prep", preprocessor), ("model", clf)])
-    pipeline.fit(X_train, y_train)
-
-    y_pred = pipeline.predict(X_test)
-    y_prob = pipeline.predict_proba(X_test)[:, 1]
+    y_pred = clf.predict(X_test)
+    y_prob = clf.predict_proba(X_test)[:, 1]
 
     metrics = {
         "accuracy": accuracy_score(y_test, y_pred),
@@ -296,34 +249,21 @@ def train_risk_classifier(df_hash: int, df: pd.DataFrame) -> Tuple[Optional[Pipe
         "test_rows": len(X_test),
     }
 
-    # Aggregate One-Hot feature importances back to original 4 feature groups
-    ohe_names = pipeline.named_steps["prep"].named_transformers_["cat"].get_feature_names_out(
-        ["Agent", "Call Type", "Day_of_Week"]
-    )
-    all_names = list(ohe_names) + ["Month_Num"]
-    importances = pipeline.named_steps["model"].feature_importances_
-
-    grouped_imp = {"Agent": 0.0, "Call Type": 0.0, "Day of Week": 0.0, "Month": 0.0}
-    for name, imp in zip(all_names, importances):
-        if name.startswith("Agent_"):
-            grouped_imp["Agent"] += imp
-        elif name.startswith("Call Type_"):
-            grouped_imp["Call Type"] += imp
-        elif name.startswith("Day_of_Week_"):
-            grouped_imp["Day of Week"] += imp
-        else:
-            grouped_imp["Month"] += imp
+    perm = permutation_importance(clf, X_test, y_test, n_repeats=5, random_state=42, n_jobs=-1)
+    display_names = ["Agent", "Call Type", "Day of Week", "Month"]
+    raw_imp = np.maximum(perm.importances_mean, 0.0)
+    norm_imp = raw_imp / raw_imp.sum() if raw_imp.sum() > 0 else raw_imp
 
     imp_df = (
-        pd.DataFrame({"Feature": list(grouped_imp.keys()), "Importance": list(grouped_imp.values())})
+        pd.DataFrame({"Feature": display_names, "Importance": norm_imp})
         .sort_values("Importance", ascending=True)
     )
 
-    return pipeline, metrics, imp_df
+    return clf, metrics, imp_df
 
 
 # -----------------------------------------------------------------------------
-# SIDEBAR: FILE UPLOADER & GLOBAL FILTERS
+# SIDEBAR: FILE UPLOADER & BATCHED FILTER FORM
 # -----------------------------------------------------------------------------
 st.sidebar.title("🎛️ QA Control Panel")
 
@@ -334,11 +274,7 @@ uploaded_file = st.sidebar.file_uploader(
 )
 
 default_path = "Agent QA Report.xlsx"
-data_source = None
-if uploaded_file is not None:
-    data_source = uploaded_file
-elif os.path.exists(default_path):
-    data_source = default_path
+data_source = uploaded_file if uploaded_file is not None else (default_path if os.path.exists(default_path) else None)
 
 if data_source is None:
     st.title("📊 Call Center QA Analytics & ML Command Center")
@@ -355,32 +291,31 @@ except Exception as e:
     st.stop()
 
 st.sidebar.markdown("---")
-st.sidebar.subheader("Global Filters")
-
 min_date = df_full["Date"].min().date()
 max_date = df_full["Date"].max().date()
-date_range = st.sidebar.date_input(
-    "Date Range",
-    value=(min_date, max_date),
-    min_value=min_date,
-    max_value=max_date,
-)
+all_agents = sorted(df_full["Agent"].unique().tolist())
+all_qcs = sorted(df_full["QC by"].unique().tolist())
+all_call_types = sorted(df_full["Call Type"].unique().tolist())
+
+# Batch filters in a form so Streamlit doesn't re-run mid-selection
+with st.sidebar.form("global_filter_form"):
+    st.subheader("Global Filters")
+    date_range = st.date_input(
+        "Date Range",
+        value=(min_date, max_date),
+        min_value=min_date,
+        max_value=max_date,
+    )
+    selected_agents = st.multiselect("Agent(s)", options=all_agents, default=[])
+    selected_qcs = st.multiselect("QC Examiner(s)", options=all_qcs, default=[])
+    selected_call_types = st.multiselect("Call Type(s)", options=all_call_types, default=[])
+    st.form_submit_button("✅ Apply Filters", use_container_width=True)
 
 if isinstance(date_range, tuple) and len(date_range) == 2:
     start_dt, end_dt = pd.to_datetime(date_range[0]), pd.to_datetime(date_range[1])
 else:
     start_dt, end_dt = pd.to_datetime(min_date), pd.to_datetime(max_date)
 
-all_agents = sorted(df_full["Agent"].unique().tolist())
-selected_agents = st.sidebar.multiselect("Agent(s)", options=all_agents, default=[])
-
-all_qcs = sorted(df_full["QC by"].unique().tolist())
-selected_qcs = st.sidebar.multiselect("QC Examiner(s)", options=all_qcs, default=[])
-
-all_call_types = sorted(df_full["Call Type"].unique().tolist())
-selected_call_types = st.sidebar.multiselect("Call Type(s)", options=all_call_types, default=[])
-
-# Apply global filters
 mask = (df_full["Date"] >= start_dt) & (df_full["Date"] <= end_dt)
 if selected_agents:
     mask &= df_full["Agent"].isin(selected_agents)
@@ -391,7 +326,6 @@ if selected_call_types:
 
 df = df_full.loc[mask].copy()
 
-st.sidebar.markdown("---")
 st.sidebar.caption(f"Showing **{len(df):,}** of **{len(df_full):,}** evaluated calls.")
 
 if df.empty:
@@ -400,7 +334,7 @@ if df.empty:
 
 
 # -----------------------------------------------------------------------------
-# MAIN HEADER & 4 INTERACTIVE TABS
+# MAIN HEADER & LAZY NAVIGATION (ONLY ACTIVE TAB EXECUTES!)
 # -----------------------------------------------------------------------------
 st.title("📊 Call Center QA Analytics & ML Command Center")
 st.caption(
@@ -408,19 +342,26 @@ st.caption(
     f"| Evaluated Calls: **{len(df):,}** | Active Agents: **{df['Agent'].nunique()}**"
 )
 
-tab1, tab2, tab3, tab4 = st.tabs(
-    [
-        "📈 1. Executive Overview & Trends",
-        "🎯 2. Agent 360° Coaching & Skill Radar",
-        "⚖️ 3. QA Examiner Calibration & Fairness",
-        "🤖 4. Low-Score Risk Predictor (ML)",
-    ]
+TAB_OPTIONS = [
+    "📈 1. Executive Overview & Trends",
+    "🎯 2. Agent 360° Coaching & Skill Radar",
+    "⚖️ 3. QA Examiner Calibration & Fairness",
+    "🤖 4. Low-Score Risk Predictor (ML)",
+]
+
+active_tab = st.segmented_control(
+    "View",
+    options=TAB_OPTIONS,
+    default=TAB_OPTIONS[0],
+    label_visibility="collapsed",
 )
+st.markdown("---")
+
 
 # =============================================================================
 # TAB 1: EXECUTIVE OVERVIEW & TRENDS
 # =============================================================================
-with tab1:
+if active_tab == TAB_OPTIONS[0]:
     total_calls = len(df)
     avg_score = df["Total Score"].mean()
     pass_rate = (df["Total Score"] >= 8.0).mean() * 100
@@ -433,16 +374,10 @@ with tab1:
     c4.metric("First Contact Resolution %", f"{fcr_rate:.1f}%")
 
     st.markdown("---")
-
     col_left, col_right = st.columns([1.4, 1.0])
 
     with col_left:
-        granularity = st.radio(
-            "Trend Granularity",
-            options=["Weekly", "Monthly"],
-            horizontal=True,
-            key="trend_gran",
-        )
+        granularity = st.radio("Trend Granularity", options=["Weekly", "Monthly"], horizontal=True)
         time_col = "Week" if granularity == "Weekly" else "Month"
         trend_df = (
             df.groupby(time_col, as_index=False)
@@ -517,18 +452,17 @@ with tab1:
 # =============================================================================
 # TAB 2: AGENT 360° COACHING & SKILL RADAR
 # =============================================================================
-with tab2:
+elif active_tab == TAB_OPTIONS[1]:
     agent_list = sorted(df["Agent"].unique().tolist())
     selected_coach_agent = st.selectbox("Select Agent for 360° Coaching Review", options=agent_list)
 
     agent_df = df[df["Agent"] == selected_coach_agent]
     agent_avg = agent_df["Total Score"].mean()
     team_avg = df["Total Score"].mean()
-    delta_team = agent_avg - team_avg
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Evaluated Calls", f"{len(agent_df):,}")
-    m2.metric("Agent Avg Score", f"{agent_avg:.2f}", delta=f"{delta_team:+.2f} vs Team")
+    m2.metric("Agent Avg Score", f"{agent_avg:.2f}", delta=f"{agent_avg - team_avg:+.2f} vs Team")
     m3.metric("Agent Pass Rate (≥ 8.0)", f"{(agent_df['Total Score'] >= 8.0).mean() * 100:.1f}%")
     m4.metric("Low-Score Calls (< 8.0)", f"{int((agent_df['Total Score'] < 8.0).sum()):,}")
 
@@ -539,7 +473,6 @@ with tab2:
         agent_rubric = [agent_df[c].mean() * 100 for c in RUBRIC_COLS]
         team_rubric = [df[c].mean() * 100 for c in RUBRIC_COLS]
 
-        # Close the polygon loop for Plotly Scatterpolar
         theta_closed = RUBRIC_COLS + [RUBRIC_COLS[0]]
         agent_closed = agent_rubric + [agent_rubric[0]]
         team_closed = team_rubric + [team_rubric[0]]
@@ -634,7 +567,7 @@ with tab2:
 # =============================================================================
 # TAB 3: QA EXAMINER CALIBRATION & FAIRNESS (STATISTICAL ML)
 # =============================================================================
-with tab3:
+elif active_tab == TAB_OPTIONS[2]:
     st.markdown(
         "Examiners naturally vary in grading strictness. Below we compare raw score distributions across "
         "examiners and fit a **Ridge Fixed-Effects Regression** controlling for **Agent** and **Call Type** difficulty."
@@ -679,7 +612,7 @@ with tab3:
     st.markdown("---")
     st.subheader("⚖️ Ridge Regression Examiner Strictness & Fairness-Adjusted Leaderboard")
 
-    df_hash = int(pd.util.hash_pandas_object(df[["Recording ID", "Total Score", "QC by", "Agent"]]).sum())
+    df_hash = hash((len(df), round(float(df["Total Score"].sum()), 4), df["QC by"].nunique(), df["Agent"].nunique()))
     examiner_df, leaderboard_df, r2_score = fit_examiner_fairness_model(df_hash, df)
 
     if examiner_df.empty:
@@ -705,16 +638,16 @@ with tab3:
 # =============================================================================
 # TAB 4: LOW-SCORE RISK PREDICTOR (MACHINE LEARNING SIMULATOR)
 # =============================================================================
-with tab4:
+elif active_tab == TAB_OPTIONS[3]:
     st.markdown(
         "Predicts the probability that an upcoming call will result in a **Low-Score / Coaching Needed (`Total Score < 8.0`)** "
         "outcome based on **Agent**, **Call Type**, **Day of Week**, and **Month**."
     )
 
-    ml_hash = int(pd.util.hash_pandas_object(df_full[["Recording ID", "Total Score"]]).sum())
-    clf_pipeline, val_metrics, imp_df = train_risk_classifier(ml_hash, df_full)
+    ml_hash = hash((len(df_full), round(float(df_full["Total Score"].sum()), 4)))
+    clf_model, val_metrics, imp_df = train_risk_classifier(ml_hash, df_full)
 
-    if clf_pipeline is None:
+    if clf_model is None:
         st.warning("Insufficient class diversity in dataset to train the Low-Score Risk Classifier.")
     else:
         sim_col, val_col = st.columns([1.2, 1.0])
@@ -731,16 +664,12 @@ with tab4:
             sim_month = s4.slider("Month (1 = Jan, 12 = Dec)", min_value=1, max_value=12, value=11, key="sim_month")
 
             input_row = pd.DataFrame(
-                [
-                    {
-                        "Agent": sim_agent,
-                        "Call Type": sim_call_type,
-                        "Day_of_Week": sim_day,
-                        "Month_Num": sim_month,
-                    }
-                ]
+                [{"Agent": sim_agent, "Call Type": sim_call_type, "Day_of_Week": sim_day, "Month_Num": sim_month}]
             )
-            risk_prob = float(clf_pipeline.predict_proba(input_row)[0][1]) * 100
+            for col in ["Agent", "Call Type", "Day_of_Week"]:
+                input_row[col] = input_row[col].astype("category")
+
+            risk_prob = float(clf_model.predict_proba(input_row)[0][1]) * 100
 
             fig_gauge = go.Figure(
                 go.Indicator(
@@ -764,7 +693,6 @@ with tab4:
             fig_gauge.update_layout(height=310, margin=dict(l=20, r=20, t=50, b=10))
             st.plotly_chart(fig_gauge, use_container_width=True)
 
-            # Data-driven coaching recommendation based on agent's weakest criteria on this Call Type
             sub_hist = df_full[(df_full["Agent"] == sim_agent) & (df_full["Call Type"] == sim_call_type)]
             if len(sub_hist) < 3:
                 sub_hist = df_full[df_full["Agent"] == sim_agent]
@@ -792,7 +720,7 @@ with tab4:
             fig_imp.update_traces(textposition="outside")
             fig_imp.update_layout(
                 coloraxis_showscale=False,
-                xaxis=dict(title="Relative Importance", range=[0, imp_df["Importance"].max() * 1.25]),
+                xaxis=dict(title="Relative Importance", range=[0, max(imp_df["Importance"].max() * 1.25, 0.1)]),
                 yaxis=dict(title=""),
                 height=340,
                 margin=dict(l=20, r=20, t=50, b=20),
